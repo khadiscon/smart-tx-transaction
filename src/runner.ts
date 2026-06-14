@@ -102,7 +102,9 @@ async function runSingleBundle(
     let blockhash: BlockhashWithExpiryBlockHeight;
     if (agentDecision === "refresh_blockhash") {
       blockhash = await getFreshBlockhash(connection);
-      logger.info("[runner] Fresh blockhash fetched per agent");
+      const freshP50 = await getP50TipLamports(connection);
+      tipLamports = Math.max(freshP50, tipLamports);
+      logger.info(`[runner] Fresh blockhash + recalculated tip (${tipLamports} lamports) per agent`);
     } else if (descriptor.staleBlockhashSlotOffset > 0) {
       blockhash = await fetchStaleBlockhash(connection, descriptor.staleBlockhashSlotOffset);
     } else {
