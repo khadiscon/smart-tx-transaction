@@ -1,98 +1,70 @@
 /**
  * src/bundles.ts
- * Builds all 10 bundle descriptors with fault labels.
+ * Fault-injection utilities used ONLY by the benchmark harness in --adverse
+ * mode. The core stack (client.ts) has no knowledge of these profiles. They
+ * exist so we can deliberately exercise the failure/retry paths against real
+ * infrastructure (the resulting rejections are genuine on-chain events), and
+ * every fault-injection submission is labeled as such in the lifecycle log.
  */
 
 import { Connection, BlockhashWithExpiryBlockHeight } from "@solana/web3.js";
 import { logger } from "./logger";
 
-export type FaultType =
-  | null
+export type FaultInjectionKind =
   | "expired_blockhash"
-  | "fee_too_low"
   | "compute_exceeded"
-  | "leader_skip_submit";
+  | "leader_skip";
 
-export interface BundleDescriptor {
-  bundleNumber: number;
-  faultType: FaultType;
-  staleBlockhashSlotOffset: number;
-  computeUnitLimit: number;
-  computeUnitPrice: number;
-  requiresSkipWindow: boolean;
+export interface FaultInjectionProfile {
   label: string;
+  kind: FaultInjectionKind;
+  description: string;
+  staleBlockhashSlotOffset?: number;
+  computeUnitLimit?: number;
+  computeUnitPrice?: number;
+  requireSkipWindow?: boolean;
+  /** Whether this profile dependably produces a failure on a healthy mainnet. */
+  reliable: boolean;
 }
 
-export function buildBundleDescriptors(): BundleDescriptor[] {
-  return [
-    // 1-5: normal
-    ...([1, 2, 3, 4, 5] as const).map((n) => ({
-      bundleNumber: n,
-      faultType: null as FaultType,
-      staleBlockhashSlotOffset: 0,
-      computeUnitLimit: 200_000,
-      computeUnitPrice: 1_000,
-      requiresSkipWindow: false,
-      label: "normal",
-    })),
+/**
+ * Fault-injection profiles for --adverse mode. Only the `reliable` ones run by default.
+ * The unreliable ones are documented but require --include-unreliable, because
+ * on a healthy network they may simply succeed (and that is honest to admit).
+ */
+export const FAULT_INJECTION_PROFILES: FaultInjectionProfile[] = [
+  {
+    label: "fault-injection:expired-blockhash",
+    kind: "expired_blockhash",
+    staleBlockhashSlotOffset: 200,
+    reliable: true,
+    description:
+      "Submits with a ~200-slot-old blockhash so the engine rejects it; exercises agent refresh_blockhash recovery.",
+  },
+  {
+    label: "fault-injection:compute-budget-exceeded",
+    kind: "compute_exceeded",
+    computeUnitLimit: 1,
+    reliable: true,
+    description:
+      "Caps the compute budget at 1 CU so the transaction cannot execute; exercises failure classification.",
+  },
+  {
+    label: "fault-injection:leader-skip-window",
+    kind: "leader_skip",
+    requireSkipWindow: true,
+    reliable: false,
+    description:
+      "Submits into a detected leader-skip gap. Unreliable; depends entirely on live network conditions.",
+  },
+];
 
-    // 6: fee too low — zero compute unit price, validators deprioritize
-    {
-      bundleNumber: 6,
-      faultType: "fee_too_low" as FaultType,
-      staleBlockhashSlotOffset: 0,
-      computeUnitLimit: 200_000,
-      computeUnitPrice: 0,
-      requiresSkipWindow: false,
-      label: "fault:fee_too_low",
-    },
-
-    // 7: expired blockhash
-    {
-      bundleNumber: 7,
-      faultType: "expired_blockhash" as FaultType,
-      staleBlockhashSlotOffset: 200,
-      computeUnitLimit: 200_000,
-      computeUnitPrice: 1_000,
-      requiresSkipWindow: false,
-      label: "fault:expired_blockhash",
-    },
-
-    // 8: compute exceeded — limit of 1 unit always fails
-    {
-      bundleNumber: 8,
-      faultType: "compute_exceeded" as FaultType,
-      staleBlockhashSlotOffset: 0,
-      computeUnitLimit: 1,
-      computeUnitPrice: 1_000,
-      requiresSkipWindow: false,
-      label: "fault:compute_exceeded",
-    },
-
-    // 9: submit during leader skip window
-    {
-      bundleNumber: 9,
-      faultType: "leader_skip_submit" as FaultType,
-      staleBlockhashSlotOffset: 0,
-      computeUnitLimit: 200_000,
-      computeUnitPrice: 1_000,
-      requiresSkipWindow: true,
-      label: "fault:leader_skip_submit",
-    },
-
-    // 10: expired blockhash again
-    {
-      bundleNumber: 10,
-      faultType: "expired_blockhash" as FaultType,
-      staleBlockhashSlotOffset: 200,
-      computeUnitLimit: 200_000,
-      computeUnitPrice: 1_000,
-      requiresSkipWindow: false,
-      label: "fault:expired_blockhash",
-    },
-  ];
-}
-
+/**
+ * Fetch a real (but stale) blockhash from `slotsAgo` slots back, used only for
+ * the expired-blockhash fault-injection profile. Throws rather than returning a
+ * degenerate all-zero blockhash, which would only produce confusing downstream
+ * errors.
+ */
 export async function fetchStaleBlockhash(
   connection: Connection,
   slotsAgo: number
@@ -100,7 +72,7 @@ export async function fetchStaleBlockhash(
   const currentSlot = await connection.getSlot("processed");
   const targetSlot = Math.max(0, currentSlot - slotsAgo);
 
-  logger.info(`[bundles] Fetching stale blockhash ~${slotsAgo} slots ago (slot ${targetSlot})`);
+  logger.info(`[fault-injection] Fetching stale blockhash ~${slotsAgo} slots ago (slot ${targetSlot})`);
 
   let slot = targetSlot;
   for (let i = 0; i < 20; i++) {
@@ -111,16 +83,15 @@ export async function fetchStaleBlockhash(
         rewards: false,
       });
       if (block) {
-        logger.info(`[bundles] Stale blockhash at slot ${slot}: ${block.blockhash.slice(0, 16)}...`);
-        return {
-          blockhash: block.blockhash,
-          lastValidBlockHeight: block.blockHeight ?? targetSlot + 150,
-        };
+        logger.info(`[fault-injection] Stale blockhash at slot ${slot}: ${block.blockhash.slice(0, 16)}...`);
+        return { blockhash: block.blockhash, lastValidBlockHeight: slot + 150 };
       }
     } catch {}
     slot = Math.max(0, slot - 1);
   }
 
-  logger.warn("[bundles] Could not find real stale block — using zeroed hash");
-  return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 0 };
+  throw new Error(
+    `[fault-injection] Could not fetch a real block within 20 slots of ${targetSlot} ` +
+    `for stale-blockhash injection - aborting rather than submitting a zeroed hash.`
+  );
 }

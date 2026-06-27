@@ -7,34 +7,52 @@ import { Connection } from "@solana/web3.js";
 import { YellowstoneClient, SlotUpdate } from "./yellowstone";
 import { logger } from "./logger";
 
-const JITO_VALIDATOR_IDENTITIES = new Set<string>([
-  "beefKGBWeSpHzYBHZXwp5So7wdQGX6mu4ZHCsH3uTar",
-  "GBU4potq4TjsmXCUSJXbXwnkYZP8725ZEaeDrLrdQhbA",
-  "9QU2QSxhb24FUX3Tu2FpczXjpK3VYrvRudywSZaM29mF",
-  "HMU77m6WSL9Xew9YvVXewbXd5NeRr6YEm5k7cDCLQFm",
-  "7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2",
-  "dv1ZAGvdsz5hHLwWmR9KaEQbCKNRBdHQQxiNELB9jnH",
-  "dv2eQHeP4RFrJZ6UeiZWoc3XTtmtZCUKqqyj1MFwdW6",
-  "dv3qDFk1DTF36Z62bNvrCXe9sKATA6xvVy6A798xxAS",
-  "dv4ACNkpYPcE3aKmYDqZm9G5EB3J4MRoeE7WNDRBVJB",
-  "Certusm1sa411sMpV9FPqU5dXAYhmmhygvxJ23S6hJ24",
-  "GkqYQysEGmuL6V2AJoNnWZUz2ZBGWhzQXsJiXm2CLMMQ",
-  "DE1bawNcRJB9rVm3buyMVfr8mBEoyendZWBK5Pst5xh8",
-  "CWGsCCCqMpBrFqcJSanvEFrHMPVBEVzfaB5tUBDuHvXR",
-  "4pi1A3UEgUH4zBRFBaXnRFxmEGfHxLcXaHVmLnYeHFyB",
-  "Fxe9vCJysTW1YRKBw9Ws6DvFKPNyBJNm7J7KhnHiRdJb",
-]);
-
+const JITO_VALIDATORS_API = "https://kobe.mainnet.jito.network/api/v1/validators";
 const LOOKAHEAD_SLOTS = 200;
 const SKIP_DETECTION_GAP = 4;
+
+let cachedJitoIdentities: Set<string> | null = null;
+let cacheFetchedAt = 0;
+let cachedSchedule: { map: Map<number, string>; fetchedAt: number; epochStart: number } | null = null;
+const CACHE_TTL_MS = 10 * 60 * 1_000;
+const SCHEDULE_TTL_MS = 60 * 1_000;
+
+/** Fetch live Jito-enabled validator identity accounts from the Kobe API. */
+export async function getJitoValidatorIdentities(): Promise<Set<string>> {
+  if (cachedJitoIdentities && Date.now() - cacheFetchedAt < CACHE_TTL_MS) {
+    return cachedJitoIdentities;
+  }
+
+  const res = await fetch(JITO_VALIDATORS_API);
+  if (!res.ok) throw new Error(`[leader] Jito validators API HTTP ${res.status}`);
+
+  const json: any = await res.json();
+  const validators: any[] = json.validators ?? [];
+  const identities = new Set(
+    validators
+      .filter((v) => v.running_jito && v.identity_account)
+      .map((v) => v.identity_account as string)
+  );
+
+  if (!identities.size) throw new Error("[leader] Jito validators API returned no identities");
+
+  cachedJitoIdentities = identities;
+  cacheFetchedAt = Date.now();
+  logger.info(`[leader] Loaded ${identities.size} Jito-enabled validator identities`);
+  return identities;
+}
 
 async function fetchLeaderSchedule(
   connection: Connection,
   currentSlot: number
 ): Promise<Map<number, string>> {
+  if (cachedSchedule && Date.now() - cachedSchedule.fetchedAt < SCHEDULE_TTL_MS) {
+    return cachedSchedule.map;
+  }
+
   logger.info("[leader] Fetching leader schedule...");
 
-  const schedule = await connection.getLeaderSchedule(currentSlot);
+  const schedule = await connection.getLeaderSchedule();
   if (!schedule) throw new Error("[leader] Could not fetch leader schedule");
 
   const epochInfo = await connection.getEpochInfo();
@@ -47,6 +65,7 @@ async function fetchLeaderSchedule(
     }
   }
 
+  cachedSchedule = { map: slotToLeader, fetchedAt: Date.now(), epochStart: epochStartSlot };
   logger.info(`[leader] Schedule loaded — ${slotToLeader.size} entries`);
   return slotToLeader;
 }
@@ -57,15 +76,61 @@ export interface LeaderWindow {
   isJitoEnabled: boolean;
 }
 
+export interface LeaderWindowOptions {
+  /**
+   * Ignore Jito leaders that are too close to the current slot. This avoids
+   * selecting a leader that is gone by the time RPC blockhash fetch/retry and
+   * bundle submission complete.
+   */
+  minLeadSlots?: number;
+  /** Do not target leaders so far ahead that a fresh blockhash may expire first. */
+  maxLeadSlots?: number;
+}
+
+function findJitoWindow(
+  slot: number,
+  slotToLeader: Map<number, string>,
+  jitoIdentities: Set<string>,
+  opts: LeaderWindowOptions = {}
+): LeaderWindow | null {
+  const minLeadSlots = opts.minLeadSlots ?? 0;
+  const maxLeadSlots = Math.min(opts.maxLeadSlots ?? LOOKAHEAD_SLOTS, LOOKAHEAD_SLOTS);
+
+  for (let i = minLeadSlots; i <= maxLeadSlots; i++) {
+    const leader = slotToLeader.get(slot + i);
+    if (leader && jitoIdentities.has(leader)) {
+      return { slot: slot + i, validatorIdentity: leader, isJitoEnabled: true };
+    }
+  }
+  return null;
+}
+
 export async function awaitJitoLeaderWindow(
   connection: Connection,
   yellowstone: YellowstoneClient,
-  timeoutMs = 120_000
+  timeoutMs = 120_000,
+  opts: LeaderWindowOptions = {}
 ): Promise<LeaderWindow> {
-  logger.info("[leader] Waiting for Jito-enabled leader window...");
+  logger.info(
+    "[leader] Waiting for Jito-enabled leader window" +
+    `${opts.minLeadSlots ? ` (${opts.minLeadSlots}+ slots lead)` : ""}...`
+  );
 
-  const currentSlot = yellowstone.getCurrentSlot();
+  const jitoIdentities = await getJitoValidatorIdentities();
+  const currentSlot = Math.max(
+    yellowstone.getCurrentSlot(),
+    await connection.getSlot("processed").catch(() => 0)
+  );
   const slotToLeader = await fetchLeaderSchedule(connection, currentSlot);
+
+  const immediate = findJitoWindow(currentSlot, slotToLeader, jitoIdentities, opts);
+  if (immediate) {
+    logger.info(
+      `[leader] Jito leader at slot ${immediate.slot} — ${immediate.validatorIdentity.slice(0, 16)}... ` +
+      `(${immediate.slot - currentSlot} slots ahead)`
+    );
+    return immediate;
+  }
 
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -75,17 +140,16 @@ export async function awaitJitoLeaderWindow(
 
     const onSlot = (update: SlotUpdate) => {
       if (update.status !== "processed") return;
+      const window = findJitoWindow(update.slot, slotToLeader, jitoIdentities, opts);
+      if (!window) return;
 
-      for (let i = 0; i <= LOOKAHEAD_SLOTS; i++) {
-        const leader = slotToLeader.get(update.slot + i);
-        if (leader && JITO_VALIDATOR_IDENTITIES.has(leader)) {
-          clearTimeout(timer);
-          yellowstone.removeListener("slot", onSlot);
-          logger.info(`[leader] Jito leader at slot ${update.slot + i} — ${leader.slice(0, 16)}... (${i} slots ahead)`);
-          resolve({ slot: update.slot + i, validatorIdentity: leader, isJitoEnabled: true });
-          return;
-        }
-      }
+      clearTimeout(timer);
+      yellowstone.removeListener("slot", onSlot);
+      logger.info(
+        `[leader] Jito leader at slot ${window.slot} — ${window.validatorIdentity.slice(0, 16)}... ` +
+        `(${window.slot - update.slot} slots ahead)`
+      );
+      resolve(window);
     };
 
     yellowstone.on("slot", onSlot);
