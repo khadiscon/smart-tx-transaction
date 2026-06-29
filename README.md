@@ -91,7 +91,7 @@ The harness runs deliberately-broken submissions by default to demonstrate detec
 
 Note that deliberately-broken bundles are usually dropped at the Jito block engine before landing, so they typically produce no explorer-verifiable slot/signature - the verifiable evidence is the lifecycle log entry with the `faultInjected` label and agent's corrective action.
 
-## README Questions (Superteam Nigeria bounty)
+
 
 ### Question 1: What does the delta between `processed_at` and `confirmed_at` tell you about network health?
 
